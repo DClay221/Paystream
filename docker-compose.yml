@@ -1,0 +1,160 @@
+services:
+
+  # ─────────────────────────────────────────────
+  # ZOOKEEPER — Kafka cluster coordinator
+  # ─────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: paystream-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - paystream-network
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────────
+  # KAFKA — Event streaming broker
+  # ─────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: paystream-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - paystream-network
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ─────────────────────────────────────────────
+  # POSTGRESQL — Operational store
+  # ─────────────────────────────────────────────
+  postgres:
+    image: postgres:15
+    container_name: paystream-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - paystream-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} && psql -U ${POSTGRES_USER} -d ${POSTGRES_DB} -c 'SELECT 1 FROM transactions LIMIT 1;' > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────────
+  # SIMULATOR — Transaction event generator
+  # ─────────────────────────────────────────────
+  simulator:
+    build:
+      context: ./simulator
+      dockerfile: Dockerfile
+    container_name: paystream-simulator
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      EVENTS_PER_SECOND: ${EVENTS_PER_SECOND:-10}
+      FRAUD_INJECTION_RATE: ${FRAUD_INJECTION_RATE:-0.05}
+    networks:
+      - paystream-network
+    restart: on-failure
+
+  # ─────────────────────────────────────────────
+  # CONSUMER — Kafka consumer + fraud engine + writers
+  # ─────────────────────────────────────────────
+  consumer:
+    build:
+      context: ./consumer
+      dockerfile: Dockerfile
+    container_name: paystream-consumer
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: payments.raw
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+      S3_BUCKET: ${S3_BUCKET}
+      FRAUD_SCORE_THRESHOLD: ${FRAUD_SCORE_THRESHOLD:-0.65}
+      SNS_TOPIC_ARN: ${SNS_TOPIC_ARN}
+    networks:
+      - paystream-network
+    restart: on-failure
+
+  # ─────────────────────────────────────────────
+  # AIRFLOW — Batch pipeline orchestrator
+  # (Phase 4 — commented out until needed)
+  # ─────────────────────────────────────────────
+  # airflow:
+  #   image: apache/airflow:2.8.0
+  #   container_name: paystream-airflow
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   environment:
+  #     AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  #     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  #     AIRFLOW__CORE__FERNET_KEY: ''
+  #     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+  #   volumes:
+  #     - ./airflow/dags:/opt/airflow/dags
+  #     - ./airflow/plugins:/opt/airflow/plugins
+  #     - airflow-logs:/opt/airflow/logs
+  #   ports:
+  #     - "8080:8080"
+  #   networks:
+  #     - paystream-network
+
+# ─────────────────────────────────────────────
+# VOLUMES — Persistent data storage
+# ─────────────────────────────────────────────
+volumes:
+  postgres-data:
+    driver: local
+  # airflow-logs:   # Uncomment in Phase 4
+  #   driver: local
+
+# ─────────────────────────────────────────────
+# NETWORKS
+# ─────────────────────────────────────────────
+networks:
+  paystream-network:
+    driver: bridge
