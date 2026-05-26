@@ -263,5 +263,5 @@ All configuration is managed through environment variables. Copy `.env.example` 
 
 ## Author
 
-**Devyn Clay**
+**Devyn Claybrooks**
 GitHub: [DClay221](https://github.com/DClay221)
